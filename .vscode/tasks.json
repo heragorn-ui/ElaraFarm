@@ -1,0 +1,40 @@
+{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "Elara: Server",
+      "type": "shell",
+      "options": {
+        "cwd": "${workspaceFolder}\\server",
+        "env": {
+          "ELARA_USER_API_KEY": "ELARA123",
+          "ELARA_JOIN_SECRET": "JOIN123",
+          "ELARA_LOG_DIR": "C:\\ElaraFarm\\worker\\logs"
+        }
+      },
+      "command": ".\\.venv\\Scripts\\python.exe",
+      "args": ["-m", "uvicorn", "server:app", "--host", "127.0.0.1", "--port", "8000", "--reload"],
+      "problemMatcher": []
+    },
+    {
+      "label": "Elara: Worker",
+      "type": "shell",
+      "options": {
+        "cwd": "${workspaceFolder}\\worker",
+        "env": {
+          "ELARA_SERVER": "http://127.0.0.1:8000",
+          "ELARA_JOIN_SECRET": "JOIN123",
+          "ELARA_WORKER_NAME": "${env:COMPUTERNAME}"
+        }
+      },
+      "command": ".\\.venv\\Scripts\\python.exe",
+      "args": ["worker.py"],
+      "problemMatcher": []
+    },
+    {
+      "label": "Elara: Start Farm",
+      "dependsOn": ["Elara: Server", "Elara: Worker"],
+      "dependsOrder": "parallel"
+    }
+  ]
+}

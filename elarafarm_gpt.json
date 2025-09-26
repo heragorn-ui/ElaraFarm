@@ -1,0 +1,40 @@
+{
+  "project": "ElaraFarm Render Manager",
+  "version": "v0.9.2-dev",
+  "owner": "Qvisten Animation (internal R&D)",
+  "language": "Python 3.11",
+  "maya_versions": ["2022", "2023", "2024", "2025"],
+  "render_engines": {
+    "current": ["Arnold"],
+    "future": ["Redshift", "Cycles", "Karma", "V-Ray"]
+  },
+  "system": {
+    "type": "Mini Web-Based Render Panel",
+    "scope": "Local for now, multi-machine planned",
+    "platform": "Windows 10/11",
+    "db": "SQLite (elarafarm.db)",
+    "log_dir": "C:\\ElaraFarm\\worker\\logs"
+  },
+  "workflow": {
+    "current_stage": [
+      "Local web UI for job submission and monitoring",
+      "Render job execution via Maya's Render.exe with Arnold"
+    ],
+    "next_stages": [
+      "Maya-integrated submitter tool (Python UI)",
+      "Remote machine support",
+      "Multi-engine integration"
+    ]
+  },
+  "communication_rules": {
+    "chat_language": "Turkish",
+    "code_language": "English only",
+    "code_style": "PATCH format by default",
+    "support_level": "Beginner-friendly (code context and placement must be explained step by step)",
+    "full_file_fallback": "Allowed when placement is unclear"
+  },
+  "notes": [
+    "User may not have advanced coding knowledge — instructions must be clear.",
+    "All code changes must be explained with exact file and location."
+  ]
+}

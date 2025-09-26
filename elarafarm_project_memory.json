@@ -1,0 +1,188 @@
+{
+  "schema_version": "2025-09",
+  "created_at": "2025-09-16T00:00:00+03:00",
+  "owner": "Murat (Qvisten Animation)",
+  "assistant_name": "Elara",
+  "project": {
+    "name": "ElaraFarm",
+    "goal": "Lightweight render farm UI + worker, pause/resume + frame controls with stable workflow.",
+    "components_versions": {
+      "server": "v0.9.3 (FastAPI + SQLite)",
+      "worker": "v0.9.4 (resume-first-missing-frame, step-aware)"
+    },
+    "tech_stack": {
+      "backend": "FastAPI (Python), SQLite",
+      "frontend": "Single-file HTML/CSS/JS rendered by server.py @app.get('/')",
+      "worker": "Python process launcher for Maya Render.exe (Arnold)",
+      "os_target": "Windows (paths, Render.exe), multi-worker capable"
+    },
+    "paths": {
+      "db": "server/elarafarm.db",
+      "logs": "C:\\\\ElaraFarm\\\\worker\\\\logs",
+      "tasks_file": "server/tasks.json (legacy in some contexts)",
+      "server_ui": "@app.get('/') in server.py"
+    },
+    "env": {
+      "ELARA_USER_API_KEY": "ELARA123 (from tasks.json example)",
+      "ELARA_JOIN_SECRET": "JOIN123",
+      "ELARA_LOG_DIR": "C:\\\\ElaraFarm\\\\worker\\\\logs",
+      "ELARA_SERVER": "http://127.0.0.1:8000",
+      "ELARA_WORKER_NAME": "<COMPUTERNAME>"
+    }
+  },
+  "agreed_rules": {
+    "language": {
+      "explanations": "Turkish",
+      "code": "English"
+    },
+    "patch_style": "Anchor-based precise patches with VSCode line numbers. If lines drift, anchors win.",
+    "signals": {
+      "no_code": "When user writes 'Kod yok', we discuss only (no code).",
+      "full_file": "User may request full file replacement for stability."
+    }
+  },
+  "current_features": {
+    "job_submit": "Form on / (auth + scene/project/output/camera/layer/frames/step/renderer).",
+    "job_queue": "Queued jobs pulled by workers via /next_job (priority DESC, id ASC).",
+    "progress": "Bar: done% + running% from server job fields; frames grid shows done/failed via /frames_status.",
+    "frame_grid": "Frames modal/tooling: retry selected/failed, split to 1-frame (all/missing).",
+    "logs": "Tail via /job_tail, file logs under LOG_DIR/job_<id>.log.",
+    "pause_resume": "UI buttons on groups/parts; server endpoints /action/pause_job & /action/resume_job.",
+    "cancel_delete": "Cancel, delete, purge endpoints available.",
+    "events": "Server-Sent Events for live frame updates (/events)."
+  },
+  "recent_fixes": [
+    {
+      "name": "Pause/Delete not stopping worker",
+      "cause": "Server was clearing cancel_requested too early in /job_update.",
+      "fix": "Server keeps cancel_requested; worker receives cancel flag and terminates gracefully.",
+      "status": "fixed in server v0.9.3"
+    },
+    {
+      "name": "Resume starts from frame 1 again",
+      "cause": "Worker always used job.start_frame.",
+      "fix": "Worker computes resume_start from first missing frame (disk scan, step-aware) and sets -s accordingly.",
+      "status": "fixed in worker v0.9.4"
+    },
+    {
+      "name": "NameError final_aligned",
+      "cause": "Mixed variable names during patch.",
+      "fix": "Unified final_aligned usage in final delta/update.",
+      "status": "fixed in worker v0.9.4"
+    },
+    {
+      "name": "Jobs auto-start on boot",
+      "cause": "Queued jobs persisted in DB from older sessions.",
+      "workaround": "Delete elarafarm.db or purge endpoints before test.",
+      "status": "known behavior by design"
+    }
+  ],
+  "open_issues": [
+    {
+      "id": "PB-001",
+      "title": "Paused state turns progress bar fully green",
+      "why": "Half-written files counted as done during disk scan.",
+      "direction": "Stabilize done detection (size threshold + quiet time; optional EXR magic check)."
+    },
+    {
+      "id": "PB-002",
+      "title": "Half frames on immediate pause (e.g., 12 KB files)",
+      "why": "Immediate terminate produces partial frame.",
+      "direction": "Introduce 'Pause (after frame)' aka NIMBY; default pause becomes graceful."
+    },
+    {
+      "id": "STAB-003",
+      "title": "Occasional failed after multiple pause/resume",
+      "why": "Non-zero exit on terminate; timing of cancel flag.",
+      "direction": "Map cancelled exits to paused/cancelled; rely on graceful pause to avoid non-zero exits."
+    },
+    {
+      "id": "CANCEL-004",
+      "title": "Cancel behaves like immediate kill leading to partials",
+      "direction": "Split into Cancel after frame vs Cancel now, mirror pause modes."
+    },
+    {
+      "id": "NET-005",
+      "title": "Network share performance/security with disk scans",
+      "risk": "rglob on SMB can be slow and see partial files from other workers.",
+      "direction": "Prefer server /frames_status as source of truth + optional .ok sidecar files."
+    }
+  ],
+  "decisions": {
+    "resume_strategy": "Hybrid. Implemented now as disk-first, step-aware (worker v0.9.4). Planned shift to server /frames_status as primary, disk as fallback.",
+    "pause_modes": {
+      "current": "Immediate stop (can leave partial frame).",
+      "planned": "Default 'Pause (after frame)' (NIMBY). 'Stop now' remains available for emergencies."
+    },
+    "done_detection": {
+      "current": "Any file with matching frame number is counted.",
+      "planned": "Size threshold (e.g., >64KB) AND quiet-time >=3s; optional EXR header check; or .ok sidecar files."
+    },
+    "multi_worker_truth": "Server DB (job_frames from /frame_update) becomes single source of truth; workers avoid deep scans on network shares."
+  },
+  "api_endpoints": {
+    "worker_registration": "POST /register_worker {join_secret,name} -> {worker_id,api_key}",
+    "next_job": "GET /next_job?worker_id&api_key -> job or null",
+    "job_update": "POST /job_update {status, frames, cancel?}",
+    "frame_update": "POST /frame_update {frames_done, frames_failed, current_frame?}",
+    "frames_status": "GET /frames_status?job_id -> {done,failed,start,end}",
+    "actions": {
+      "pause_job": "POST /action/pause_job?id=... (current: immediate; planned: mode=graceful|immediate)",
+      "resume_job": "POST /action/resume_job?id=...",
+      "cancel_job": "POST /action/cancel_job?id=... (planned: mode=after_frame|now)",
+      "retry_job": "POST /action/retry_job?id=...",
+      "resubmit_frames": "POST /action/resubmit_frames {job_id,frames}",
+      "split_job_to_frames": "POST /action/split_job_to_frames {job_id,only_missing}",
+      "group_actions": "cancel_group, delete_group, retry_failed_group",
+      "purge": "purge_finished, purge_deleted"
+    }
+  },
+  "ui_ux": {
+    "jobs_table": "Group/job rows with Actions (Frames, Log, Retry, Pause, Resume, Cancel, Delete).",
+    "frames_modal": "Grid with selection, retry failed/selected, split to 1-frame (all/missing).",
+    "toasts_dialogs": "Custom modal confirm + toast; no native alerts.",
+    "css_status": "queued, running, done, failed, cancelled, paused (colors).",
+    "planned": {
+      "pause_menu": "Pause (after frame) & Stop now",
+      "cancel_menu": "Cancel after frame & Cancel now",
+      "paused_overlay": "Dim overlay on progress bar while paused",
+      "resume_hint": "Show 'will resume at frame N' info"
+    }
+  },
+  "worker_logic": {
+    "render_cmd": "Render.exe -r arnold -s <resume_start> -e <end> -b <step> -proj <project> -rd <output> [-cam] [-rl] <scene>",
+    "resume": "Compute first missing frame from existing outputs (step-aware); start from there.",
+    "updates": "Every ~2s: /frame_update deltas + /job_update with frame_total/done/running.",
+    "cancel_handling": "On cancel flag: terminate/kill; planned graceful mode completes current frame before stopping.",
+    "finalization": "Status 'done' only if aligned_done >= frame_total; otherwise 'failed' unless cancelled/paused."
+  },
+  "testing": {
+    "run_via_vscode_tasks": "Elara: Start Farm (parallel Server+Worker) or individual tasks.",
+    "clean_boot": "Delete server/elarafarm.db or use purge endpoints to avoid old queued jobs.",
+    "basic_flow": [
+      "Submit (chunk_size=0, step=1)",
+      "Pause during frame write → verify no full-green bar once done detection stabilized",
+      "Resume → verify resume_start advances",
+      "Repeat pause/resume to confirm stability",
+      "Cancel (after frame/now) tests"
+    ]
+  },
+  "patch_history": [
+    "Server v0.9.3: keep cancel_requested; add pause/resume actions; protect paused/cancelled in job_update.",
+    "Worker W1: resume from first missing frame (step-aware).",
+    "Worker W1.fix: final_aligned NameError & final update corrections.",
+    "Worker v0.9.4: consolidated clean file with fixes.",
+    "Planned: G1 (graceful pause), D1 (done stability), R1 (frames_status-first), U1 (UI menus/overlay)."
+  ],
+  "risks": [
+    "SMB/NAS latency on rglob scans",
+    "Partial files miscounted as done (mitigated by D1)",
+    "Non-zero exit on immediate terminate (mitigated by G1 + mapping to paused)"
+  ],
+  "next_actions": [
+    "G1: Implement Pause (after frame) & Cancel (after frame) modes end-to-end (UI param + worker behavior).",
+    "D1: Done-detection stability (min size + quiet time; optional EXR magic; optional .ok sidecar).",
+    "R1: Prefer /frames_status for resume; disk scan as fallback.",
+    "U1: UI polish (pause/cancel menus, paused overlay, resume-hint)."
+  ]
+}
