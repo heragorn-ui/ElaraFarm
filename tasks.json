@@ -25,9 +25,10 @@
           "ELARA_SERVER": "http://127.0.0.1:8000",
           "ELARA_JOIN_SECRET": "JOIN123",
           "ELARA_WORKER_NAME": "${env:COMPUTERNAME}",
-          "ELARA_MIN_FRAME_SIZE_KB": "128",
+          "ELARA_MIN_FRAME_SIZE_KB": "64",
           "ELARA_FRAME_QUIET_SEC": "2.5",
-          "ELARA_NIMBY_TIMEOUT_SEC": "600"
+          "ELARA_NIMBY_TIMEOUT_SEC": "600",
+          "ELARA_DEBUG": "1"
 
         }
       },

@@ -5,6 +5,10 @@ import os, re, time, threading, subprocess, shutil
 from pathlib import Path
 from typing import Dict, Any, Set, List, Optional
 import requests
+DEBUG = os.environ.get("ELARA_DEBUG", "0") not in ("", "0", "false", "False")
+def dlog(*a):
+    if DEBUG:
+        print(*a)
 
 SERVER      = os.environ.get("ELARA_SERVER", "http://127.0.0.1:8000")
 JOIN_SECRET = os.environ.get("ELARA_JOIN_SECRET", "CHANGE_ME")
@@ -44,6 +48,16 @@ WORKER_ID=None; API_KEY=None
 
 FRAME_RE=re.compile(r"(\d{3,6})")
 IMAGE_EXTS=(".exr",".png",".jpg",".tif",".tiff",".bmp")
+# Per-extension minimal sizes (KB) — if not specified, MIN_SIZE_KB is used
+EXT_MIN_KB = {
+    ".png": 32,
+    ".jpg": 16,
+    ".jpeg": 16,
+    ".bmp": 32,
+    ".tif": 64,
+    ".tiff": 64,
+    ".exr": MIN_SIZE_KB,  # use global default for EXR
+}
 
 def list_done_frames(output_dir:str, start:int, end:int)->Set[int]:
     """Scan output directory and collect frames that look fully written (D1 filter)."""
@@ -65,7 +79,9 @@ def list_done_frames(output_dir:str, start:int, end:int)->Set[int]:
                 st = f.stat()
             except Exception:
                 continue
-            if st.st_size < MIN_SIZE_KB * 1024:
+            ext = f.suffix.lower()
+            min_kb = EXT_MIN_KB.get(ext, MIN_SIZE_KB)
+            if st.st_size < min_kb * 1024:
                 continue
             if (now_ts - st.st_mtime) < QUIET_SEC:
                 continue
@@ -124,6 +140,8 @@ def run_render(job:Dict[str,Any]):
     # --- Resume logic: detect already-rendered frames and start from the first missing one ---
     existing_done = list_done_frames(output, start, end)
     aligned_done: Set[int] = {fr for fr in existing_done if (fr - start) % step == 0}
+    dlog(f"[debug] output_dir={output}")
+    dlog(f"[debug] found done frames (raw) = {sorted(list(existing_done))[:12]} ... total={len(existing_done)}")
 
     # If everything is already rendered, finish without launching Render.exe
     if len(aligned_done) >= frame_total:
@@ -139,6 +157,9 @@ def run_render(job:Dict[str,Any]):
         return
 
     resume_start = first_missing(start, end, step, aligned_done)
+    dlog(f"[debug] aligned_done={sorted(list(aligned_done))[:12]} ... total={len(aligned_done)}")
+    dlog(f"[debug] resume_start={resume_start}  (start={start}, end={end}, step={step})")
+
     if resume_start is None:  # safety (same as all-done)
         try:
             post_json("/job_update", {
@@ -227,39 +248,43 @@ def run_render(job:Dict[str,Any]):
             print("[worker] update error:", e)
             cancel_code = 0
 
-        # Arm NIMBY once (remember how many frames were done when the request came in)
-               # Arm NIMBY once (remember how many frames were done when the request came)
+                # Log which cancel code we got (0 none, 1 immediate, 2 graceful)
+        dlog(f"[debug] cancel_code={cancel_code}  done={current_done_count} fail=0 run=1")
+
+        # Arm NIMBY once
         if cancel_code == 2 and not graceful_pending:
             graceful_pending = True
             graceful_done_mark = current_done_count
+            nimby_armed_ts = time.time()
             print(f"[worker] NIMBY armed at done={graceful_done_mark}")
-            nimby_armed_ts = time.time()  # safety window start
-
-        # Safety: if armed for too long, allow terminate to avoid hanging forever
-        if cancel_code == 2 and graceful_pending:
-            if time.time() - nimby_armed_ts > 600:  # 10 minutes
-                print("[worker] NIMBY safety timeout → terminating renderer")
-                should_terminate = True
 
         # Decide termination
         should_terminate = False
 
-        # Pause (immediate): stop now
+        # Immediate pause
         if cancel_code == 1:
-            print("[worker] Pause (immediate) requested → terminating renderer")
+            print("[worker] Pause (immediate) → terminate now")
             should_terminate = True
 
-        # NIMBY: wait until one more frame completes (D1 filter guarantees full frame)
-        elif cancel_code == 2:
-            if current_done_count > graceful_done_mark:
-                print(f"[worker] NIMBY: +{current_done_count - graceful_done_mark} frame (D1-ok) → terminating renderer")
+        # Graceful (NIMBY): terminate only after one more D1-valid frame is observed
+        elif cancel_code == 2 and graceful_pending:
+            # Safety window: if stuck too long, bail out
+            try:
+                nimby_to = float(os.environ.get("ELARA_NIMBY_TIMEOUT_SEC", "600"))
+            except Exception:
+                nimby_to = 600.0
+            if time.time() - nimby_armed_ts > nimby_to:
+                print("[worker] NIMBY safety timeout → terminate")
+                should_terminate = True
+            elif current_done_count > graceful_done_mark:
+                print(f"[worker] NIMBY: +{current_done_count - graceful_done_mark} frame (D1-ok) → terminate")
                 should_terminate = True
 
         if should_terminate:
             try:
                 proc.terminate()
                 try:
-                    proc.wait(timeout=5)  # graceful exit window
+                    proc.wait(timeout=5)
                 except subprocess.TimeoutExpired:
                     print("[worker] renderer did not exit in time → kill()")
                     proc.kill()
@@ -270,6 +295,7 @@ def run_render(job:Dict[str,Any]):
         # Renderer finished naturally?
         if code is not None:
             break
+
 
 
     # finalize
