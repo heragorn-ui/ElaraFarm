@@ -65,7 +65,7 @@ min_kb = EXT_MIN_KB.get(ext, MIN_SIZE_KB)
 if st.st_size < min_kb * 1024:
     continue
 
-def list_done_frames(output_dir:str, start:int, end:int)->Set[int]:
+def list_done_frames(output_dir: str, start: int, end: int) -> Set[int]:
     """Scan output directory and collect frames that look fully written (D1 filter)."""
     root = Path(output_dir or "")
     s: Set[int] = set()
@@ -74,24 +74,28 @@ def list_done_frames(output_dir:str, start:int, end:int)->Set[int]:
 
     now_ts = time.time()
     try:
-        for f in root.rglob("*"):
+        for f in root.rglob("*"):              # <--- for döngüsü
             if not f.is_file():
                 continue
-            if f.suffix.lower() not in IMAGE_EXTS:
+
+            ext = f.suffix.lower()
+            if ext not in IMAGE_EXTS:
                 continue
 
-            # D1 filter: size + quiet-time
+            # Stat
             try:
                 st = f.stat()
             except Exception:
                 continue
-            ext = f.suffix.lower()
+
+            # Min size (per extension) + quiet time
             min_kb = EXT_MIN_KB.get(ext, MIN_SIZE_KB)
             if st.st_size < min_kb * 1024:
                 continue
             if (now_ts - st.st_mtime) < QUIET_SEC:
                 continue
 
+            # Extract frame number
             m = FRAME_RE.search(f.stem)
             if not m:
                 continue
@@ -99,12 +103,14 @@ def list_done_frames(output_dir:str, start:int, end:int)->Set[int]:
                 fr = int(m.group(1))
                 if start <= fr <= end:
                     s.add(fr)
-            except:
+            except Exception:
                 pass
+
     except Exception as e:
         print("[worker] rglob error:", e)
 
     return s
+
 
 
 def first_missing(start:int, end:int, step:int, done:Set[int]) -> Optional[int]:
