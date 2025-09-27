@@ -285,3 +285,5 @@ def main():
 
 if __name__=="__main__":
     main()
+    # worker test
+    # python worker.py
