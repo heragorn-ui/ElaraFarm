@@ -14,7 +14,8 @@
       },
       "command": ".\\.venv\\Scripts\\python.exe",
       "args": ["-m", "uvicorn", "server:app", "--host", "127.0.0.1", "--port", "8000", "--reload"],
-      "problemMatcher": []
+      "problemMatcher": [],
+      "presentation": { "panel": "dedicated", "reveal": "always", "clear": true }
     },
     {
       "label": "Elara: Worker",
@@ -25,16 +26,18 @@
           "ELARA_SERVER": "http://127.0.0.1:8000",
           "ELARA_JOIN_SECRET": "JOIN123",
           "ELARA_WORKER_NAME": "${env:COMPUTERNAME}",
-          "ELARA_MIN_FRAME_SIZE_KB": "64",
-          "ELARA_FRAME_QUIET_SEC": "3",
+          "ELARA_LOG_DIR": "C:\\ElaraFarm\\worker\\logs",
+
+          "ELARA_MIN_FRAME_SIZE_KB": "128",
+          "ELARA_FRAME_QUIET_SEC": "2.5",
           "ELARA_NIMBY_TIMEOUT_SEC": "600",
           "ELARA_DEBUG": "1"
-
         }
       },
       "command": ".\\.venv\\Scripts\\python.exe",
       "args": ["worker.py"],
-      "problemMatcher": []
+      "problemMatcher": [],
+      "presentation": { "panel": "dedicated", "reveal": "always", "clear": true }
     },
     {
       "label": "Elara: Start Farm",
