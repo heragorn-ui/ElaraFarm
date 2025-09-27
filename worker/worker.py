@@ -46,8 +46,9 @@ RENDER_EXE=find_render_exe()
 session=requests.Session()
 WORKER_ID=None; API_KEY=None
 
-FRAME_RE=re.compile(r"(\d{3,6})")
-IMAGE_EXTS=(".exr",".png",".jpg",".tif",".tiff",".bmp")
+FRAME_RE = re.compile(r"(?:^|[^\d])(\d{1,6})(?:[^\d]|$)")
+IMAGE_EXTS = (".exr",".png",".jpg",".jpeg",".tif",".tiff",".bmp",".hdr",".tx",".tga")
+
 # Per-extension minimal sizes (KB) — if not specified, MIN_SIZE_KB is used
 EXT_MIN_KB = {
     ".png": 32,
@@ -58,6 +59,11 @@ EXT_MIN_KB = {
     ".tiff": 64,
     ".exr": MIN_SIZE_KB,  # use global default for EXR
 }
+# ...
+ext = f.suffix.lower()
+min_kb = EXT_MIN_KB.get(ext, MIN_SIZE_KB)
+if st.st_size < min_kb * 1024:
+    continue
 
 def list_done_frames(output_dir:str, start:int, end:int)->Set[int]:
     """Scan output directory and collect frames that look fully written (D1 filter)."""
@@ -136,6 +142,19 @@ def run_render(job:Dict[str,Any]):
     width=int(job.get("width") or 1920); height=int(job.get("height") or 1080)
     renderer=(job.get("renderer") or "arnold").lower()
     frame_total=((end-start)//step)+1
+   
+    # Fallback: if disk scan found nothing but server remembers progress, respect it
+    srv_done = int(job.get("frame_done") or 0)
+    if resume_start == start and srv_done > 0:
+        # compute frame number from srv_done
+        fr = start
+        step = max(1, step)
+        # advance srv_done frames
+        for _ in range(srv_done):
+            fr += step
+        if fr <= end:
+            print(f"[worker] resume fallback → using server frame_done={srv_done}, start={fr}")
+            resume_start = fr
 
     # --- Resume logic: detect already-rendered frames and start from the first missing one ---
     existing_done = list_done_frames(output, start, end)
