@@ -13,6 +13,14 @@ WORKER_NAME = os.environ.get("ELARA_WORKER_NAME", os.environ.get("COMPUTERNAME",
 LOG_DIR     = Path(os.environ.get("ELARA_LOG_DIR", r"C:\ElaraFarm\worker\logs"))
 LOG_DIR.mkdir(parents=True, exist_ok=True)
 
+# --- D1 thresholds (done-detection) ---
+# A frame file is considered "done" only if:
+#  - size >= MIN_SIZE_KB (to avoid partial files)
+#  - last modification time is older than QUIET_SEC (file not being written anymore)
+MIN_SIZE_KB = int(os.environ.get("ELARA_MIN_FRAME_SIZE_KB", "128"))
+QUIET_SEC   = float(os.environ.get("ELARA_FRAME_QUIET_SEC", "2.5"))
+
+
 # Try to locate Maya Render.exe
 RENDER_EXE_CANDIDATES = [
     os.environ.get("ELARA_RENDER_EXE") or "",
@@ -38,22 +46,44 @@ FRAME_RE=re.compile(r"(\d{3,6})")
 IMAGE_EXTS=(".exr",".png",".jpg",".tif",".tiff",".bmp")
 
 def list_done_frames(output_dir:str, start:int, end:int)->Set[int]:
-    """Scan output directory and collect frames with numeric token in filename."""
-    root=Path(output_dir or ""); s:Set[int]=set()
-    if not root.exists(): return s
+    """Scan output directory and collect frames that look fully written (D1 filter)."""
+    root = Path(output_dir or "")
+    s: Set[int] = set()
+    if not root.exists():
+        return s
+
+    now_ts = time.time()
     try:
         for f in root.rglob("*"):
-            if not f.is_file(): continue
-            if f.suffix.lower() not in IMAGE_EXTS: continue
-            m=FRAME_RE.search(f.stem)
-            if not m: continue
+            if not f.is_file():
+                continue
+            if f.suffix.lower() not in IMAGE_EXTS:
+                continue
+
+            # D1 filter: size + quiet-time
             try:
-                fr=int(m.group(1))
-                if start<=fr<=end: s.add(fr)
-            except: pass
+                st = f.stat()
+            except Exception:
+                continue
+            if st.st_size < MIN_SIZE_KB * 1024:
+                continue
+            if (now_ts - st.st_mtime) < QUIET_SEC:
+                continue
+
+            m = FRAME_RE.search(f.stem)
+            if not m:
+                continue
+            try:
+                fr = int(m.group(1))
+                if start <= fr <= end:
+                    s.add(fr)
+            except:
+                pass
     except Exception as e:
         print("[worker] rglob error:", e)
+
     return s
+
 
 def first_missing(start:int, end:int, step:int, done:Set[int]) -> Optional[int]:
     """Find first missing frame in [start..end] stepping by 'step'. Returns None if all done."""
@@ -198,21 +228,31 @@ def run_render(job:Dict[str,Any]):
             cancel_code = 0
 
         # Arm NIMBY once (remember how many frames were done when the request came in)
+               # Arm NIMBY once (remember how many frames were done when the request came)
         if cancel_code == 2 and not graceful_pending:
             graceful_pending = True
             graceful_done_mark = current_done_count
             print(f"[worker] NIMBY armed at done={graceful_done_mark}")
+            nimby_armed_ts = time.time()  # safety window start
+
+        # Safety: if armed for too long, allow terminate to avoid hanging forever
+        if cancel_code == 2 and graceful_pending:
+            if time.time() - nimby_armed_ts > 600:  # 10 minutes
+                print("[worker] NIMBY safety timeout → terminating renderer")
+                should_terminate = True
 
         # Decide termination
         should_terminate = False
+
+        # Pause (immediate): stop now
         if cancel_code == 1:
-            # Pause (immediate): stop now
             print("[worker] Pause (immediate) requested → terminating renderer")
             should_terminate = True
+
+        # NIMBY: wait until one more frame completes (D1 filter guarantees full frame)
         elif cancel_code == 2:
-            # NIMBY: wait until one more frame completes
             if current_done_count > graceful_done_mark:
-                print("[worker] NIMBY condition met (frame finished) → terminating renderer")
+                print(f"[worker] NIMBY: +{current_done_count - graceful_done_mark} frame (D1-ok) → terminating renderer")
                 should_terminate = True
 
         if should_terminate:
@@ -227,9 +267,10 @@ def run_render(job:Dict[str,Any]):
                 print("[worker] terminate error:", te)
             break
 
+        # Renderer finished naturally?
         if code is not None:
-            # Renderer finished naturally
             break
+
 
     # finalize
     try: t.join(timeout=2)
