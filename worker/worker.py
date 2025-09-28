@@ -197,18 +197,43 @@ def register() -> int:
             "join_secret": JOIN_SECRET,
             "name": WORKER_NAME
         }, timeout=10)
+        # hata ayıklama için yanıtı sakla
+        try:
+            txt = r.text
+        except Exception:
+            txt = "<no text>"
         r.raise_for_status()
         data = r.json()
-        wid = int(data.get("id", 0))
-        print(f"[worker] registered id={wid}")
+
+        # hem "id" hem "worker_id" anahtarlarını destekle
+        wid = int(data.get("id") or data.get("worker_id") or 0)
+
+        if wid <= 0:
+            print("[worker] register response:", txt)  # hata/uyumsuzluk için göster
+        else:
+            print(f"[worker] registered id={wid}")
         return wid
+
     except Exception as e:
         print("[worker] register error:", e)
         time.sleep(3)
         return 0
 
 
+
 def poll_next_job(worker_id: int) -> Optional[dict]:
+    """Ask server for next job. Prefer GET (some servers reject POST with 405)."""
+    # First try GET (recommended by server logs)
+    try:
+        r = session.get(f"{SERVER}/next_job", params={"worker_id": worker_id}, timeout=15)
+        if r.status_code == 204:
+            return None
+        r.raise_for_status()
+        return r.json()
+    except Exception:
+        pass
+
+    # Fallback: try POST in case server supports it
     try:
         r = session.post(f"{SERVER}/next_job", json={"worker_id": worker_id}, timeout=15)
         if r.status_code == 204:
@@ -217,6 +242,7 @@ def poll_next_job(worker_id: int) -> Optional[dict]:
         return r.json()
     except Exception:
         return None
+
 
 
 def post_update(job_id: int, payload: dict) -> dict:
