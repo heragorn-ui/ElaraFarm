@@ -7,13 +7,22 @@
       "options": {
         "cwd": "${workspaceFolder}\\server",
         "env": {
-          "ELARA_USER_API_KEY": "ELARA123",
+          "ELARA_USER_API_KEY": "UserAPI_ChangeMe_123",
           "ELARA_JOIN_SECRET": "JOIN123",
           "ELARA_LOG_DIR": "C:\\ElaraFarm\\worker\\logs"
         }
       },
       "command": ".\\.venv\\Scripts\\python.exe",
-      "args": ["-m", "uvicorn", "server:app", "--host", "127.0.0.1", "--port", "8000", "--reload"],
+      "args": [
+        "-m",
+        "uvicorn",
+        "server:app",
+        "--host",
+        "127.0.0.1",
+        "--port",
+        "8000",
+        "--reload"
+      ],
       "problemMatcher": [],
       "presentation": { "panel": "dedicated", "reveal": "always", "clear": true }
     },
@@ -25,13 +34,13 @@
         "env": {
           "ELARA_SERVER": "http://127.0.0.1:8000",
           "ELARA_JOIN_SECRET": "JOIN123",
+          "ELARA_USER_API_KEY": "UserAPI_ChangeMe_123",
           "ELARA_WORKER_NAME": "${env:COMPUTERNAME}",
           "ELARA_LOG_DIR": "C:\\ElaraFarm\\worker\\logs",
-
+          "ELARA_DEBUG": "1",
           "ELARA_MIN_FRAME_SIZE_KB": "128",
           "ELARA_FRAME_QUIET_SEC": "2.5",
-          "ELARA_NIMBY_TIMEOUT_SEC": "600",
-          "ELARA_DEBUG": "1"
+          "ELARA_NIMBY_TIMEOUT_SEC": "600"
         }
       },
       "command": ".\\.venv\\Scripts\\python.exe",
