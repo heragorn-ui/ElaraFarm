@@ -1,301 +1,287 @@
 # -*- coding: utf-8 -*-
-"""
-ElaraFarm - Worker (auth-hardened)
-- Register: supports {"worker_id":..,"api_key":..}
-- next_job: GET with id/worker_id + API key (headers + params + cookie)
-- job_update: API key (headers + body)
-- Pause / NIMBY / Resume + D1 (min size + quiet time)
-- Debug logs when ELARA_DEBUG=1
-"""
-import os, re, time, subprocess
+# ElaraFarm Worker v0.9.8 — Pause (immediate) & NIMBY (after-frame) + resume from first missing frame
+
+import os, re, time, threading, subprocess, shutil
 from pathlib import Path
-from typing import Set, List, Optional
+from typing import Dict, Any, Set, List, Optional
 import requests
 
-# ---------- Env / globals ----------
-SERVER = os.environ.get("ELARA_SERVER", "http://127.0.0.1:8000").rstrip("/")
-JOIN_SECRET = os.environ.get("ELARA_JOIN_SECRET", "JOIN123")
-WORKER_NAME = os.environ.get("ELARA_WORKER_NAME", os.environ.get("COMPUTERNAME", "worker"))
-LOG_DIR = Path(os.environ.get("ELARA_LOG_DIR", str(Path.cwd() / "logs")))
+SERVER      = os.environ.get("ELARA_SERVER", "http://127.0.0.1:8000")
+JOIN_SECRET = os.environ.get("ELARA_JOIN_SECRET", "CHANGE_ME")
+WORKER_NAME = os.environ.get("ELARA_WORKER_NAME", os.environ.get("COMPUTERNAME","worker"))
 
-DEBUG = os.environ.get("ELARA_DEBUG", "0") not in ("", "0", "false", "False")
-def dlog(*a):
-    if DEBUG: print(*a)
-
-# Asıl anahtar ortamdan gelir; register dönerse REG_API'de yedeklenir
-API_KEY: str = os.environ.get("ELARA_USER_API_KEY", "")  # MUST match server task
-REG_API: str = ""                                        # optional from register
-
-IMAGE_EXTS = (".exr",".png",".jpg",".jpeg",".tif",".tiff",".bmp",".hdr",".tx",".tga")
-FRAME_RE = re.compile(r"(?:^|[^\d])(\d{1,6})(?:[^\d]|$)")
-MIN_SIZE_KB = int(os.environ.get("ELARA_MIN_FRAME_SIZE_KB", "128"))
-QUIET_SEC   = float(os.environ.get("ELARA_FRAME_QUIET_SEC", "2.5"))
-NIMBY_TIMEOUT_SEC = float(os.environ.get("ELARA_NIMBY_TIMEOUT_SEC", "600"))
-EXT_MIN_KB = {".png":32,".jpg":16,".jpeg":16,".bmp":32,".tif":64,".tiff":64,".exr":MIN_SIZE_KB}
-
-def find_render_exe()->str:
-    for c in (r"C:\Program Files\Autodesk\Maya2025\bin\Render.exe",
-              r"C:\Program Files\Autodesk\Maya2024\bin\Render.exe",
-              r"C:\Program Files\Autodesk\Maya2023\bin\Render.exe"):
-        if Path(c).exists(): return c
-    return "Render.exe"
-
-RENDER_EXE = find_render_exe()
-session = requests.Session()
+LOG_DIR     = Path(os.environ.get("ELARA_LOG_DIR", r"C:\ElaraFarm\worker\logs"))
 LOG_DIR.mkdir(parents=True, exist_ok=True)
 
-print("=== Elara Worker ===")
-print("SERVER:", SERVER)
-print("RENDER_EXE:", RENDER_EXE)
+# Try to locate Maya Render.exe
+RENDER_EXE_CANDIDATES = [
+    os.environ.get("ELARA_RENDER_EXE") or "",
+    r"C:\Program Files\Autodesk\Maya2025\bin\Render.exe",
+    r"C:\Program Files\Autodesk\Maya2024\bin\Render.exe",
+    r"C:\Program Files\Autodesk\Maya2023\bin\Render.exe",
+    "Render.exe",
+]
+def find_render_exe()->str:
+    for p in RENDER_EXE_CANDIDATES:
+        if not p: continue
+        pp=Path(p)
+        if pp.exists(): return str(pp)
+        w=shutil.which(str(pp))
+        if w: return w
+    return "Render.exe"
+RENDER_EXE=find_render_exe()
 
-# ---------- auth helpers (HEM header HEM query HEM cookie) ----------
+session=requests.Session()
+WORKER_ID=None; API_KEY=None
 
-def current_key() -> str:
-    # Öncelik ENV → yoksa register’dan gelen
-    return API_KEY or REG_API or ""
+FRAME_RE=re.compile(r"(\d{3,6})")
+IMAGE_EXTS=(".exr",".png",".jpg",".tif",".tiff",".bmp")
 
-def apply_session_auth():
-    """Default header/cookie’leri oturuma uygula (her çağrıdan önce çağırılır)."""
-    key = current_key()
-    if not key: return
-    # Headers: yaygın tüm isimler
-    session.headers.update({
-        "X-API-KEY": key,
-        "X-USER-API-KEY": key,
-        "X-ELARA-USER-API-KEY": key,
-        "USER_API_KEY": key,
-        "Authorization": f"Bearer {key}",
-    })
-    # Cookie
-    session.cookies.set("USER_API_KEY", key)
-
-def auth_params() -> dict:
-    """Query/body içine eklenecek param varyantları."""
-    key = current_key()
-    if not key: return {}
-    return {
-        "api_key": key,
-        "user_api_key": key,
-        "USER_API_KEY": key,
-        "userApiKey": key,
-    }
-
-# ---------- fs helpers ----------
-
-def list_done_frames(output_dir: str, start: int, end: int) -> Set[int]:
-    root = Path(output_dir or "")
-    s: Set[int] = set()
+def list_done_frames(output_dir:str, start:int, end:int)->Set[int]:
+    """Scan output directory and collect frames with numeric token in filename."""
+    root=Path(output_dir or ""); s:Set[int]=set()
     if not root.exists(): return s
-    now_ts = time.time()
     try:
         for f in root.rglob("*"):
             if not f.is_file(): continue
-            ext = f.suffix.lower()
-            if ext not in IMAGE_EXTS: continue
-            try: st = f.stat()
-            except Exception: continue
-            min_kb = EXT_MIN_KB.get(ext, MIN_SIZE_KB)
-            if st.st_size < min_kb*1024: continue
-            if (now_ts - st.st_mtime) < QUIET_SEC: continue
-            m = FRAME_RE.search(f.stem)
+            if f.suffix.lower() not in IMAGE_EXTS: continue
+            m=FRAME_RE.search(f.stem)
             if not m: continue
             try:
-                fr = int(m.group(1))
-                if start <= fr <= end: s.add(fr)
-            except Exception: pass
+                fr=int(m.group(1))
+                if start<=fr<=end: s.add(fr)
+            except: pass
     except Exception as e:
         print("[worker] rglob error:", e)
     return s
 
-def align_done_to_step(done:Set[int], start:int, end:int, step:int)->List[int]:
-    if step<=0: step=1
-    seq=[]; fr=start
-    while fr<=end:
-        if fr in done: seq.append(fr); fr+=step
-        else: break
-    return seq
+def first_missing(start:int, end:int, step:int, done:Set[int]) -> Optional[int]:
+    """Find first missing frame in [start..end] stepping by 'step'. Returns None if all done."""
+    fr = int(start)
+    st = max(1, int(step))
+    while fr <= int(end):
+        if fr not in done:
+            return fr
+        fr += st
+    return None
 
-def first_missing(start:int,end:int,step:int,aligned:List[int])->int:
-    if step<=0: step=1
-    fr=start
-    for d in aligned:
-        if d==fr: fr+=step
-        else: break
-    return fr
+def post_json(url:str, payload:Dict[str,Any])->Dict[str,Any]:
+    r=session.post(f"{SERVER}{url}", json=payload, timeout=15)
+    r.raise_for_status()
+    return r.json()
 
-def build_render_cmd(job:dict,start_frame:int)->List[str]:
-    scene=job["scene"]; proj=job.get("project_root") or ""; out=job.get("output_dir") or ""
+def register():
+    global WORKER_ID, API_KEY
+    r=session.post(f"{SERVER}/register_worker", json={"join_secret":JOIN_SECRET,"name":WORKER_NAME}, timeout=10)
+    r.raise_for_status()
+    data=r.json()
+    WORKER_ID=data["worker_id"]; API_KEY=data["api_key"]
+    print(f"[worker] registered id={WORKER_ID}")
+
+def get_next_job():
+    r=session.get(f"{SERVER}/next_job", params={"worker_id":WORKER_ID,"api_key":API_KEY}, timeout=10)
+    r.raise_for_status()
+    return r.json().get("job")
+
+def run_render(job:Dict[str,Any]):
+    jid=job["id"]; scene=job["scene"]; project=job["project"]; output=job["output_dir"]
+    camera=job.get("camera") or ""; layer=job.get("layer") or ""
+    start=int(job["start_frame"]); end=int(job["end_frame"]); step=max(1,int(job.get("by_step") or 1))
     width=int(job.get("width") or 1920); height=int(job.get("height") or 1080)
-    rend=job.get("renderer") or "arnold"; cam=job.get("camera") or ""; layer=job.get("layer") or ""
-    end_frame=int(job.get("end") or start_frame); step=int(job.get("step") or 1)
-    args=[RENDER_EXE,"-r",rend,"-s",str(start_frame),"-e",str(end_frame),"-b",str(step)]
-    if proj: args+=["-proj",proj]
-    if out:  args+=["-rd",out]
-    args+=["-x",str(width),"-y",str(height)]
-    if cam:   args+=["-cam",cam]
-    if layer: args+=["-rl",layer]
-    args+=[scene]
-    return args
+    renderer=(job.get("renderer") or "arnold").lower()
+    frame_total=((end-start)//step)+1
 
-# ---------- server comms ----------
+    # --- Resume logic: detect already-rendered frames and start from the first missing one ---
+    existing_done = list_done_frames(output, start, end)
+    aligned_done: Set[int] = {fr for fr in existing_done if (fr - start) % step == 0}
 
-def register()->int:
-    """Register worker; store worker_id and register-time api_key (backup)."""
-    global REG_API
-    try:
-        apply_session_auth()
-        r = session.post(f"{SERVER}/register_worker",
-                         json={"join_secret":JOIN_SECRET,"name":WORKER_NAME},
-                         timeout=10)
-        raw = r.text
-        r.raise_for_status()
-        data = r.json()
-        wid = int(data.get("id") or data.get("worker_id") or 0)
-        regk = data.get("api_key") or ""
-        if regk: REG_API = regk
-        if wid <= 0:
-            print("[worker] register response:", raw)
-        else:
-            print(f"[worker] registered id={wid}")
-        return wid
-    except Exception as e:
-        print("[worker] register error:", e)
-        time.sleep(3)
-        return 0
+    # If everything is already rendered, finish without launching Render.exe
+    if len(aligned_done) >= frame_total:
+        try:
+            post_json("/job_update", {
+                "worker_id": WORKER_ID, "api_key": API_KEY, "job_id": jid,
+                "status": "done", "frame_total": frame_total,
+                "frame_done": len(aligned_done), "frame_failed": 0,
+                "frame_running": 0, "log_tail": "resume: all frames already present on disk"
+            })
+        except Exception as e:
+            print("[worker] finalize-done update failed:", e)
+        return
 
-def poll_next_job(worker_id: int) -> Optional[dict]:
-    apply_session_auth()
-    params = {"id": worker_id, "worker_id": worker_id}
-    params.update(auth_params())
-    try:
-        r = session.get(f"{SERVER}/next_job", params=params, timeout=15)
-        if r.status_code == 204:
-            return None
-        if r.status_code == 401:
-            print("[worker] next_job 401 → url:", r.url, "| headers:", dict(session.headers))
-        r.raise_for_status()
-        data = r.json()
-        if not isinstance(data, dict):
-            return None
-        if "job" in data and isinstance(data["job"], dict):
-            return data["job"]
-        return data
-    except Exception:
-        return None
+    resume_start = first_missing(start, end, step, aligned_done)
+    if resume_start is None:  # safety (same as all-done)
+        try:
+            post_json("/job_update", {
+                "worker_id": WORKER_ID, "api_key": API_KEY, "job_id": jid,
+                "status": "done", "frame_total": frame_total,
+                "frame_done": len(aligned_done), "frame_failed": 0,
+                "frame_running": 0, "log_tail": "resume: no missing frames"
+            })
+        except Exception as e:
+            print("[worker] finalize-done update failed:", e)
+        return
 
-
-def post_update(job_id: int, payload: dict) -> dict:
-    apply_session_auth()
-    p = dict(payload)
-    p["job_id"] = job_id
-    p.update(auth_params())
-    try:
-        r = session.post(f"{SERVER}/job_update", json=p, timeout=10)
-        if r.status_code == 401:
-            print("[worker] job_update 401 → headers:", dict(session.headers), "| body-keys:", list(p.keys()))
-        r.raise_for_status()
-        return r.json()
-    except Exception:
-        return {}
-
-
-# ---------- core ----------
-
-def run_render(job:dict)->None:
-    job_id=int(job["id"])
-    start=int(job.get("start") or 1); end=int(job.get("end") or start); step=int(job.get("step") or 1)
-    output=job.get("output_dir") or ""
-
-    existing=list_done_frames(output,start,end)
-    dlog(f"[debug] output_dir={output}")
-    dlog(f"[debug] found done frames (raw) = {sorted(list(existing))[:12]} ... total={len(existing)}")
-    aligned=align_done_to_step(existing,start,end,step)
-    dlog(f"[debug] aligned_done={aligned[:12]} ... total={len(aligned)}")
-
-    resume_start=first_missing(start,end,step,aligned)
     print(f"[worker] resume start → frame {resume_start} (was {start})")
 
-    srv_done=int(job.get("frame_done") or 0)
-    if resume_start==start and srv_done>0:
-        fr=start
-        for _ in range(srv_done): fr+=step
-        if fr<=end:
-            print(f"[worker] resume fallback → server frame_done={srv_done}, start={fr}")
-            resume_start=fr
+    log_path=LOG_DIR/f"job_{jid}.log"; tail:List[str]=[]
 
-    cmd=build_render_cmd(job,resume_start)
+    def push_tail(line:str):
+        if not line: return
+        tail.append(line.rstrip("\n"))
+        if len(tail)>200: del tail[:len(tail)-200]
+
+    # Respect Maya file naming: do NOT pass -im/-of (let Maya/Layers handle file names)
+    cmd=[RENDER_EXE,"-r",renderer,"-s",str(resume_start),"-e",str(end),"-b",str(step),
+         "-proj",project,"-rd",output,"-x",str(width),"-y",str(height)]
+    if camera: cmd+=["-cam",camera]
+    if layer:  cmd+=["-rl",layer]
+    cmd+=[scene]
+
     print("[worker] launching:", " ".join(cmd))
-    proc=subprocess.Popen(cmd,stdout=subprocess.PIPE,stderr=subprocess.STDOUT,text=True)
 
-    graceful_pending=False; graceful_done_mark=0; nimby_armed_ts=0.0
-    post_update(job_id,{"status":"running","pid":proc.pid})
+    log_f=open(log_path,"w",encoding="utf-8",errors="replace")
+    proc=subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                          text=True, encoding="utf-8", errors="replace")
 
+    def reader():
+        for line in proc.stdout:
+            log_f.write(line); push_tail(line)
+        try: proc.stdout.close()
+        except: pass
+    t=threading.Thread(target=reader,daemon=True); t.start()
+
+    # initial update
     try:
-        while True:
-            line=proc.stdout.readline()
-            if line: pass
-            code=proc.poll()
+        post_json("/job_update", {"worker_id":WORKER_ID,"api_key":API_KEY,"job_id":jid,
+                                  "status":"running","frame_total":frame_total,
+                                  "frame_done":len(aligned_done),
+                                  "frame_failed":0,"frame_running":1,"log_tail":"\n".join(tail)})
+    except Exception as e:
+        print("[worker] first update failed:", e)
 
-            now_done=list_done_frames(output,start,end)
-            current_done_count=len(align_done_to_step(now_done,start,end,step))
+    # --- Control state for Pause/NIMBY ---
+    prev_done: Set[int] = set(aligned_done)
+    graceful_pending = False          # armed when cancel_code==2 first seen
+    graceful_done_mark = len(prev_done)  # done count at the moment NIMBY is requested
 
-            resp=post_update(job_id,{"done":current_done_count,"status":"running","pid":proc.pid})
-            cv=resp.get("cancel",0)
-            try: cancel_code=int(cv) if not isinstance(cv,bool) else (1 if cv else 0)
-            except Exception: cancel_code=0
-            dlog(f"[debug] cancel_code={cancel_code}  done={current_done_count}")
-
-            if cancel_code==2 and not graceful_pending:
-                graceful_pending=True; graceful_done_mark=current_done_count; nimby_armed_ts=time.time()
-                print(f"[worker] NIMBY armed at done={graceful_done_mark}")
-
-            should_terminate=False
-            if cancel_code==1:
-                print("[worker] Pause (immediate) → terminate now"); should_terminate=True
-            elif cancel_code==2 and graceful_pending:
-                if (time.time()-nimby_armed_ts)>NIMBY_TIMEOUT_SEC:
-                    print("[worker] NIMBY safety timeout → terminate"); should_terminate=True
-                elif current_done_count>graceful_done_mark:
-                    print(f"[worker] NIMBY: +{current_done_count - graceful_done_mark} frame (D1-ok) → terminate")
-                    should_terminate=True
-
-            if should_terminate:
-                try:
-                    proc.terminate()
-                    try: proc.wait(timeout=5)
-                    except subprocess.TimeoutExpired:
-                        print("[worker] renderer did not exit in time → kill()"); proc.kill()
-                except Exception as te:
-                    print("[worker] terminate error:", te)
-                break
-
-            if code is not None: break
-            time.sleep(0.2)
-    finally:
-        final_done=list_done_frames(output,start,end)
-        aligned_final=align_done_to_step(final_done,start,end,step)
-        post_update(job_id,{"status":"done","done":len(aligned_final)})
-
-# ---------- main ----------
-def main():
-    wid=0
-    while wid==0:
-        wid=register()
-        if wid==0: time.sleep(2)
-
+    # main loop
     while True:
-        job=poll_next_job(wid)
-        if not job: time.sleep(1.0); continue
+        time.sleep(2.0)
+        code = proc.poll()
+
+        # scan disk again and align to step
+        cur_done = list_done_frames(output, start, end)
+        cur_aligned: Set[int] = {fr for fr in cur_done if (fr - start) % step == 0}
+        delta = sorted(list(cur_aligned - prev_done))
+        prev_done = cur_aligned
+        current_done_count = len(cur_aligned)
+
+        if delta:
+            try:
+                post_json("/frame_update", {"worker_id":WORKER_ID,"api_key":API_KEY,"job_id":jid,"frames_done":delta})
+            except Exception as e:
+                print("[worker] frame_update error:", e)
+
+        # periodic job_update → read cancel code
         try:
-            jid=job.get("id"); s=int(job.get("start") or 0); e=int(job.get("end") or 0)
-            print(f"[worker] got job id={jid} {s}-{e}")
-            if jid is None:
-                time.sleep(1.0); continue
+            resp = post_json("/job_update", {"worker_id":WORKER_ID,"api_key":API_KEY,"job_id":jid,"status":"running",
+                                             "frame_total":frame_total,"frame_done":current_done_count,"frame_failed":0,
+                                             "frame_running":1,"log_tail":"\n".join(tail)})
+            # parse cancel: 0 none, 1 immediate (Pause), 2 graceful (NIMBY)
+            cv = resp.get("cancel", 0)
+            try:
+                cancel_code = int(cv) if not isinstance(cv, bool) else (1 if cv else 0)
+            except Exception:
+                cancel_code = 0
+        except Exception as e:
+            print("[worker] update error:", e)
+            cancel_code = 0
+
+        # Arm NIMBY once (remember how many frames were done when the request came in)
+        if cancel_code == 2 and not graceful_pending:
+            graceful_pending = True
+            graceful_done_mark = current_done_count
+            print(f"[worker] NIMBY armed at done={graceful_done_mark}")
+
+        # Decide termination
+        should_terminate = False
+        if cancel_code == 1:
+            # Pause (immediate): stop now
+            print("[worker] Pause (immediate) requested → terminating renderer")
+            should_terminate = True
+        elif cancel_code == 2:
+            # NIMBY: wait until one more frame completes
+            if current_done_count > graceful_done_mark:
+                print("[worker] NIMBY condition met (frame finished) → terminating renderer")
+                should_terminate = True
+
+        if should_terminate:
+            try:
+                proc.terminate()
+                try:
+                    proc.wait(timeout=5)  # graceful exit window
+                except subprocess.TimeoutExpired:
+                    print("[worker] renderer did not exit in time → kill()")
+                    proc.kill()
+            except Exception as te:
+                print("[worker] terminate error:", te)
+            break
+
+        if code is not None:
+            # Renderer finished naturally
+            break
+
+    # finalize
+    try: t.join(timeout=2)
+    except: pass
+
+    final_done = list_done_frames(output, start, end)
+    final_aligned: Set[int] = {fr for fr in final_done if (fr - start) % step == 0}
+    status = "done" if (proc.returncode == 0 and len(final_aligned) >= frame_total) else "failed"
+
+    # flush any last-delta frames
+    try:
+        last_delta = sorted(list(final_aligned - prev_done))
+        if last_delta:
+            post_json("/frame_update", {"worker_id":WORKER_ID,"api_key":API_KEY,"job_id":jid,"frames_done":last_delta})
+    except Exception:
+        pass
+
+    # final job_update (server will preserve paused/cancelled if cancel was requested)
+    try:
+        post_json("/job_update", {"worker_id":WORKER_ID,"api_key":API_KEY,"job_id":jid,"status":status,"frame_total":frame_total,
+                                  "frame_done":len(final_aligned),
+                                  "frame_failed":0 if status=='done' else max(0, frame_total - len(final_aligned)),
+                                  "frame_running":0,"log_tail":"\n".join(tail)})
+    except Exception as e:
+        print("[worker] final update error:", e)
+
+    try: log_f.close()
+    except: pass
+
+def main():
+    print("=== Elara Worker ==="); print("SERVER:", SERVER); print("RENDER_EXE:", RENDER_EXE)
+    register()
+    while True:
+        try:
+            job = get_next_job()
+        except Exception as e:
+            print("[worker] next_job error:", e); time.sleep(2.0); continue
+        if not job:
+            time.sleep(2.0); continue
+        print(f"[worker] got job id={job['id']} {job['start_frame']}-{job['end_frame']}")
+        try:
             run_render(job)
         except Exception as e:
             print("[worker] run_render error:", e)
-            try: post_update(int(job.get("id",0)),{"status":"failed"})
-            except Exception: pass
+            try:
+                total=((int(job["end_frame"])-int(job["start_frame"]))//max(1,int(job.get('by_step') or 1)))+1
+                post_json("/job_update", {"worker_id":WORKER_ID,"api_key":API_KEY,"job_id":job["id"],"status":"failed",
+                                          "frame_total": total,
+                                          "frame_done": 0, "frame_failed": total, "frame_running": 0,
+                                          "log_tail": f"worker exception: {e}"})
+            except Exception:
+                pass
 
 if __name__=="__main__":
     main()
